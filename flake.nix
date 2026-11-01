@@ -1,6 +1,11 @@
 {
   description = "shq: shell job queue with attachable ptys";
 
+  nixConfig = {
+    extra-substituters = ["https://kata.cachix.org"];
+    extra-trusted-public-keys = ["kata.cachix.org-1:l3Qa7glGu6EVSEYAoH7tqWXacHx7ghhYUbBGPucxmm8="];
+  };
+
   inputs = {
     ghostty.url = "github:ghostty-org/ghostty";
     nixpkgs.follows = "ghostty/nixpkgs";

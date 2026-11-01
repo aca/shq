@@ -2,7 +2,7 @@ name: cachix
 
 on:
   push:
-    branches: [master]
+    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -10,7 +10,7 @@ jobs:
   build:
     strategy:
       matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm]
+        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4

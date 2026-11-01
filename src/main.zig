@@ -3,27 +3,35 @@
 //! a libghostty-vt Terminal so a reattaching client gets the current screen.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const vt = @import("ghostty-vt");
 const c = std.c;
 const Allocator = std.mem.Allocator;
 
 extern "c" fn openpty(amaster: *c_int, aslave: *c_int, name: ?[*]u8, termp: ?*const anyopaque, winp: ?*const c.winsize) c_int;
 extern "c" fn execvp(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
-// std.c.termios is 44 bytes but glibc's struct termios is 60, so tcgetattr
-// through std.c overwrites the stack. Treat it as an opaque glibc-sized blob.
-const Termios = extern struct { buf: [64]u8 align(8) };
+// std.c.termios is 44 bytes but glibc's struct termios is 60 (macOS: 72), so
+// tcgetattr through std.c overwrites the stack. Treat it as an opaque blob.
+const Termios = extern struct { buf: [128]u8 align(8) };
 extern "c" fn tcgetattr(fd: c.fd_t, t: *Termios) c_int;
 extern "c" fn tcsetattr(fd: c.fd_t, action: c_int, t: *const Termios) c_int;
 extern "c" fn cfmakeraw(t: *Termios) void;
 extern "c" fn signal(sig: c_int, handler: usize) usize;
 extern "c" fn close_range(first: c_uint, last: c_uint, flags: c_int) c_int;
 extern "c" fn daemon(nochdir: c_int, noclose: c_int) c_int;
+extern "c" fn getdtablesize() c_int;
+// std.c.ioctl takes a c_int request, too narrow for macOS's TIOCSWINSZ.
+extern "c" fn ioctl(fd: c.fd_t, request: c_ulong, ...) c_int;
 
 const SIG_DFL: usize = 0;
 const SIG_IGN: usize = 1;
 const SIGHUP = 1;
 const SIGPIPE = 13;
 const SIGWINCH = 28;
+
+// std.posix.T lacks these on macOS.
+const TIOCSCTTY = if (builtin.os.tag == .macos) 0x20007461 else std.posix.T.IOCSCTTY;
+const TIOCSWINSZ = if (builtin.os.tag == .macos) 0x80087467 else std.posix.T.IOCSWINSZ;
 
 /// Ctrl-\ detaches.
 const detach_key: u8 = 0x1c;
@@ -287,7 +295,9 @@ fn getLock(lock_path: [:0]const u8) ?c.fd_t {
 /// returns the client end of a socketpair that is already connected to it.
 fn startServer(lockfd: c.fd_t, lock_path: [:0]const u8) c.fd_t {
     var pair: [2]c.fd_t = undefined;
-    if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM | c.SOCK.CLOEXEC, 0, &pair) != 0) die("socketpair failed\n", .{});
+    // No SOCK_CLOEXEC: macOS lacks it (std.c.SOCK.CLOEXEC is only a std.posix shim).
+    if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &pair) != 0) die("socketpair failed\n", .{});
+    for (pair) |p| _ = c.fcntl(p, c.F.SETFD, @as(c_int, c.FD_CLOEXEC));
 
     // Block signals across the forks so e.g. a terminal hangup can't hit the
     // server before daemon() has called setsid().
@@ -320,8 +330,9 @@ fn startServer(lockfd: c.fd_t, lock_path: [:0]const u8) c.fd_t {
 }
 
 fn tryConnect(path: [:0]const u8) ?c.fd_t {
-    const fd = c.socket(c.AF.UNIX, c.SOCK.STREAM | c.SOCK.CLOEXEC, 0);
+    const fd = c.socket(c.AF.UNIX, c.SOCK.STREAM, 0);
     if (fd < 0) return null;
+    _ = c.fcntl(fd, c.F.SETFD, @as(c_int, c.FD_CLOEXEC));
     var addr = unixAddr(path);
     if (c.connect(fd, @ptrCast(&addr), @sizeOf(c.sockaddr.un)) != 0) {
         _ = c.close(fd);
@@ -389,8 +400,9 @@ fn daemonMain(io: std.Io, gpa: Allocator, opts: StartOpts) !void {
         _ = c.unlink(path);
     }
 
-    const fd = c.socket(c.AF.UNIX, c.SOCK.STREAM | c.SOCK.CLOEXEC, 0);
+    const fd = c.socket(c.AF.UNIX, c.SOCK.STREAM, 0);
     if (fd < 0) die("socket failed\n", .{});
+    _ = c.fcntl(fd, c.F.SETFD, @as(c_int, c.FD_CLOEXEC));
     var addr = unixAddr(path);
     _ = c.umask(0o077);
     if (c.bind(fd, @ptrCast(&addr), @sizeOf(c.sockaddr.un)) != 0) die("bind {s} failed\n", .{path});
@@ -400,11 +412,15 @@ fn daemonMain(io: std.Io, gpa: Allocator, opts: StartOpts) !void {
         _ = c.close(opts.lockfd);
     }
 
-    const chld = chldSet();
-    std.posix.sigprocmask(std.posix.SIG.BLOCK, &chld, null);
-    const sfd = try std.posix.signalfd(-1, &chld, std.os.linux.SFD.CLOEXEC | std.os.linux.SFD.NONBLOCK);
+    // Self-pipe for SIGCHLD (signalfd is Linux-only).
+    if (c.pipe(&sigchld_pipe) != 0) die("pipe failed\n", .{});
+    for (sigchld_pipe) |p| {
+        _ = c.fcntl(p, c.F.SETFD, @as(c_int, c.FD_CLOEXEC));
+        _ = c.fcntl(p, c.F.SETFL, @as(c_int, @bitCast(c.O{ .NONBLOCK = true })));
+    }
+    _ = signal(@intFromEnum(std.posix.SIG.CHLD), @intFromPtr(&onChld));
 
-    var d: Daemon = .{ .io = io, .gpa = gpa, .listen_fd = fd, .sigchld_fd = sfd };
+    var d: Daemon = .{ .io = io, .gpa = gpa, .listen_fd = fd, .sigchld_fd = sigchld_pipe[0] };
     if (opts.first_client >= 0) {
         const cl = try gpa.create(Client);
         cl.* = .{ .fd = opts.first_client };
@@ -413,10 +429,10 @@ fn daemonMain(io: std.Io, gpa: Allocator, opts: StartOpts) !void {
     try run(&d);
 }
 
-fn chldSet() std.posix.sigset_t {
-    var set = std.posix.sigemptyset();
-    std.posix.sigaddset(&set, .CHLD);
-    return set;
+var sigchld_pipe: [2]c.fd_t = .{ -1, -1 };
+
+fn onChld(_: c_int) callconv(.c) void {
+    _ = c.write(sigchld_pipe[1], "x", 1);
 }
 
 const Ref = union(enum) { listen, sigchld, job: *Job, client: *Client };
@@ -498,8 +514,8 @@ fn closeMaster(j: *Job) void {
 }
 
 fn reapChildren(d: *Daemon) void {
-    var info: [128]u8 = undefined; // signalfd_siginfo; contents unused
-    while (c.read(d.sigchld_fd, &info, info.len) > 0) {}
+    var drain: [128]u8 = undefined;
+    while (c.read(d.sigchld_fd, &drain, drain.len) > 0) {}
     while (true) {
         var status: c_int = 0;
         const pid = c.waitpid(-1, &status, std.posix.W.NOHANG);
@@ -562,14 +578,17 @@ fn startJob(j: *Job) !void {
     }
     if (pid == 0) {
         _ = signal(SIGPIPE, SIG_DFL);
-        const chld = chldSet();
-        std.posix.sigprocmask(std.posix.SIG.UNBLOCK, &chld, null);
         _ = c.setsid();
-        _ = c.ioctl(s, std.posix.T.IOCSCTTY, @as(c_int, 0));
+        _ = ioctl(s, TIOCSCTTY, @as(c_int, 0));
         _ = c.dup2(s, 0);
         _ = c.dup2(s, 1);
         _ = c.dup2(s, 2);
-        _ = close_range(3, std.math.maxInt(c_uint), 0);
+        if (builtin.os.tag == .linux) {
+            _ = close_range(3, std.math.maxInt(c_uint), 0);
+        } else {
+            var fd: c_int = 3;
+            while (fd < getdtablesize()) : (fd += 1) _ = c.close(fd);
+        }
         _ = c.chdir(j.cwd);
         // Swap in the client's environment so execvp searches its PATH.
         c.environ = @ptrCast(j.envp.ptr);
@@ -592,7 +611,7 @@ fn resizeJob(d: *Daemon, j: *Job, rows: u16, cols: u16) void {
     j.ws = .{ .row = rows, .col = cols, .xpixel = 0, .ypixel = 0 };
     j.term.resize(d.gpa, .{ .cols = cols, .rows = rows }) catch |err|
         std.log.err("job {d}: resize failed: {t}", .{ j.id, err });
-    if (j.master >= 0) _ = c.ioctl(j.master, std.posix.T.IOCSWINSZ, &j.ws);
+    if (j.master >= 0) _ = ioctl(j.master, TIOCSWINSZ, &j.ws);
 }
 
 fn onClientReadable(d: *Daemon, cl: *Client) void {
@@ -904,7 +923,7 @@ fn rdInt(comptime T: type, p: []const u8, off: usize) T {
 
 fn winsize(fd: c.fd_t) c.winsize {
     var ws: c.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
-    _ = c.ioctl(fd, std.posix.T.IOCGWINSZ, &ws);
+    _ = ioctl(fd, std.posix.T.IOCGWINSZ, &ws);
     return ws;
 }
 
